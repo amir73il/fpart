@@ -1,4 +1,7 @@
-#!/bin/sh
+#!/bin/bash
+
+# This script is a derivative work of https://github.com/martymac/fpart/blob/3fb1f67e4759fea87ecd12f3b5c0e33c4f95abed/tools/fpsync
+# under permission from https://github.com/martymac/fpart/blob/3fb1f67e4759fea87ecd12f3b5c0e33c4f95abed/COPYING
 
 # Copyright (c) 2014-2023 Ganael LAPLANCHE <ganael.laplanche@martymac.org>
 # All rights reserved.
@@ -74,7 +77,7 @@ OPT_DELETERUN=""
 # User-settable tool options (-o)
 OPT_TOOL=""
 # Fpart options (-O)
-OPT_FPART="-x|.zfs|-x|.snapshot*|-x|.ckpt"
+OPT_FPART="-x|.zfs|-x|.snapshot*|-x|.ckpt|-x|~snapshot|-x|@Recycle|-x|@Recently-Snapshot"
 # Sudo mode (-S)
 OPT_SUDO=""
 # Verbose mode (-v)
@@ -128,6 +131,8 @@ SYNCHRONIZATION OPTIONS:
               See fpsync(1) for more details.
   -O options  override default fpart options with pipe-separated <options>
               See fpsync(1) for more details.
+  -c file     use CTERA dynamic rsync options file
+  -i file     use CTERA includes filter file with fpart
   -S          use sudo for filesystem crawling and synchronizations
   src_dir/    source directory (absolute path)
   dst_url/    destination directory (or URL, when using 'rsync' tool)
@@ -421,9 +426,11 @@ tool_init_fpart_job_command () {
                     fi; \
                 fi; \
                 ${SUDO} ${TOOL_BIN} ${OPT_TOOL} ${TOOL_MODEOPTS} \
+                -T \\\"${OPT_DSTURL}/\$(((\${FPART_PARTNUMBER}%${OPT_JOBS})+1))/${MIGTOOL_TMP_DIR}\\\" \
                 \\\${TOOL_MODEOPTS_R} --files-from=\\\"\${FPART_PARTFILENAME}\\\" --from0 \
                 \\\"${OPT_SRCDIR}/\\\" \
                 \\\"${OPT_DSTURL}/\\\"' \
+                \\\"${OPT_DSTURL}/\$(((\${FPART_PARTNUMBER}%${OPT_JOBS})+1))${MIGTOOL_PATH_SUFFIX}/\\\"' \
                 1>\"${FPART_LOGDIR}/\${FPART_PARTNUMBER}.stdout\" \
                 2>\"${FPART_LOGDIR}/\${FPART_PARTNUMBER}.stderr\""
         fi
@@ -484,7 +491,7 @@ tool_uses_forbidden_option () {
 parse_opts () {
     local opt OPTARG OPTIND
 
-    while getopts "m:T:n:f:s:Ew:d:t:M:plr:Ra:D:o:O:Svh" opt
+    while getopts "m:T:n:f:s:Ew:d:t:M:plr:Ra:D:o:O:c:i:Svh" opt
     do
         case "${opt}" in
         "m")
@@ -618,6 +625,20 @@ parse_opts () {
         "S")
             OPT_SUDO="yes"
             ;;
+        "c")
+            if [ -n "${OPTARG}" ] && [ -f "${OPTARG}" ]; then
+                 CTERA_MIGTOOL_DYNAMIC="${OPTARG}"
+            else
+                 end_die "No CTERA dynamic rsync options file specified for -c, or file was specified but does not exist"
+            fi
+            ;;
+        "i")
+            if [ -n "${OPTARG}" ] && [ -f "${OPTARG}" ]; then
+                 CTERA_MIGTOOL_INCLUDES_FILE="${OPTARG}"
+            else
+                 end_die "No CTERA includes file specified for -i, or file was specified but does not exist"
+            fi
+            ;;
         "v")
             OPT_VERBOSE="$((${OPT_VERBOSE} + 1))"
             ;;
@@ -717,7 +738,11 @@ parse_opts () {
     fi
     if [ -z "${OPT_TOOL}" ]
     then
-        OPT_TOOL=$(tool_get_base_opts "${OPT_TOOL_NAME}")
+        CTERA_MIGTOOL_PLACEHOLDER=""
+        if [ -n "$CTERA_MIGTOOL_DYNAMIC" ] && [ -f "$CTERA_MIGTOOL_DYNAMIC" ]; then
+            CTERA_MIGTOOL_PLACEHOLDER="CTERA_MIGTOOL_DYNAMIC"
+        fi
+        OPT_TOOL="$(tool_get_base_opts "${OPT_TOOL_NAME}") ${CTERA_MIGTOOL_PLACEHOLDER}"
     else
         tool_uses_forbidden_option "${OPT_TOOL_NAME}" "${OPT_TOOL}" && \
             end_die "Incompatible option(s) detected within toolopts (option -o)"
@@ -1302,6 +1327,11 @@ _run_start_time="$(date '+%s')"
 # When not resuming a previous run, start fpart
 if [ -z "${OPT_RUNID}" ]
 then
+    if [ -n "$CTERA_MIGTOOL_INCLUDES_FILE" ]; then
+       . "$CTERA_MIGTOOL_INCLUDES_FILE"
+    else
+        CTERA_MIGTOOL_INCLUDES=()
+    fi
     # Set limited traps during FS crawling
     # They will possibly be overridden if starting the queue manager
     trap ':' 2
@@ -1339,7 +1369,7 @@ then
             ${SUDO} "${FPART_BIN}" \
             $([ ${OPT_FPMAXPARTFILES} -gt 0 ] && printf '%s\n' "-f ${OPT_FPMAXPARTFILES}") \
             $({ { is_num "${OPT_FPMAXPARTSIZE}" && [ ${OPT_FPMAXPARTSIZE} -gt 0 ] ;} || is_size "${OPT_FPMAXPARTSIZE}" ;} && printf '%s\n' "-s ${OPT_FPMAXPARTSIZE}") \
-            -o "${FPART_PARTSTMPL}" -0 -e ${OPT_FPART} ${FPART_MODEOPTS} -L \
+            -o "${FPART_PARTSTMPL}" -0 -e ${OPT_FPART} ${FPART_MODEOPTS} "${CTERA_MIGTOOL_INCLUDES[@]}" -L \
             -W "${FPART_POSTHOOK}" . 1>"${FPART_LOGFIFO}" 2>&1
 
         if [ $? -ne 0 ]
@@ -1383,6 +1413,9 @@ then
                 if [ -z "${OPT_WRKRS}" ]
                 then
                     echo_log "2" "=> [QMGR] Starting job ${JOBS_WORKDIR}/${_next_job} (local)"
+                    if [ -n "$CTERA_MIGTOOL_DYNAMIC" ] && [ -f "$CTERA_MIGTOOL_DYNAMIC" ]; then
+                       sed -i "s;CTERA_MIGTOOL_DYNAMIC;$(cat $CTERA_MIGTOOL_DYNAMIC);g;" "${JOBS_WORKDIR}/${_NEXT}"
+                    fi
                     # We want a new process group for each sync process to
                     # prevent SIGINT propagation
                     set -m
